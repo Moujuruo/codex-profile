@@ -1,0 +1,960 @@
+#!/usr/bin/env python3
+"""Manage named Codex base_url/API-key pairs without external dependencies."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import contextlib
+import datetime as dt
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.parse import urlsplit
+
+
+VERSION = "1.1.0"
+REGISTRY_VERSION = 1
+REGISTRY_NAME = "provider-profiles.json"
+BACKUP_DIR_NAME = "provider-profile-backups"
+KEY_FIELD = "OPENAI_API_KEY"
+
+
+class CliError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Paths:
+    home: Path
+    config: Path
+    auth: Path
+    registry: Path
+    lock: Path
+    backups: Path
+
+
+def build_paths(home: str) -> Paths:
+    root = Path(home).expanduser().resolve()
+    return Paths(
+        home=root,
+        config=root / "config.toml",
+        auth=root / "auth.json",
+        registry=root / REGISTRY_NAME,
+        lock=root / f".{REGISTRY_NAME}.lock",
+        backups=root / BACKUP_DIR_NAME,
+    )
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def timestamp() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S.%f%z")
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+@contextlib.contextmanager
+def locked(paths: Paths) -> Iterator[None]:
+    paths.home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "r+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+    finally:
+        # fd is owned and closed by fdopen after a successful conversion.
+        pass
+
+
+def atomic_write_text(path: Path, content: str, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        os.chmod(path, mode)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def read_text(path: Path, label: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise CliError(f"找不到 {label}: {path}") from exc
+    except OSError as exc:
+        raise CliError(f"无法读取 {label}: {path}: {exc}") from exc
+
+
+def load_json_object(path: Path, label: str) -> dict[str, Any]:
+    text = read_text(path, label)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"{label} 不是有效 JSON: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise CliError(f"{label} 顶层必须是 JSON 对象: {path}")
+    return value
+
+
+def validate_name(name: str) -> str:
+    if name != name.strip() or not name:
+        raise CliError("配置名称不能为空，且首尾不能有空格")
+    if len(name) > 64 or any(ord(char) < 32 for char in name):
+        raise CliError("配置名称不能超过 64 个字符，也不能包含控制字符")
+    return name
+
+
+def validate_base_url(value: str) -> str:
+    value = value.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise CliError("base_url 必须是完整的 http:// 或 https:// 地址")
+    if parsed.username or parsed.password:
+        raise CliError("base_url 不能包含用户名或密码")
+    if parsed.query or parsed.fragment:
+        raise CliError("base_url 不能包含查询参数或 URL 片段")
+    return value
+
+
+def validate_api_key(value: str) -> str:
+    if not value or not value.strip():
+        raise CliError("API key 不能为空")
+    if "\n" in value or "\r" in value:
+        raise CliError("API key 不能包含换行符")
+    return value.strip()
+
+
+def normalized_url(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    path = parsed.path.rstrip("/")
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
+
+
+def fingerprint(profile: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        profile["provider"],
+        normalized_url(profile["base_url"]),
+        profile["api_key"],
+    )
+
+
+def key_id(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:10]
+
+
+def new_registry() -> dict[str, Any]:
+    return {
+        "version": REGISTRY_VERSION,
+        "active": None,
+        "profiles": {},
+    }
+
+
+def validate_profile(name: str, value: Any) -> dict[str, Any]:
+    validate_name(name)
+    if not isinstance(value, dict):
+        raise CliError(f"配置 {name!r} 的记录损坏")
+    required = {"provider", "base_url", "api_key"}
+    if not required.issubset(value):
+        raise CliError(f"配置 {name!r} 缺少字段: {', '.join(sorted(required - set(value)))}")
+    if not isinstance(value["provider"], str) or not value["provider"]:
+        raise CliError(f"配置 {name!r} 的 provider 无效")
+    validate_base_url(value["base_url"])
+    validate_api_key(value["api_key"])
+    return value
+
+
+def load_registry(paths: Paths) -> dict[str, Any]:
+    if not paths.registry.exists():
+        return new_registry()
+    registry = load_json_object(paths.registry, "配置组文件")
+    if registry.get("version") != REGISTRY_VERSION:
+        raise CliError(
+            f"不支持的配置组文件版本: {registry.get('version')!r}，"
+            f"当前仅支持 {REGISTRY_VERSION}"
+        )
+    profiles = registry.get("profiles")
+    if not isinstance(profiles, dict):
+        raise CliError("配置组文件中的 profiles 必须是对象")
+    for name, profile in profiles.items():
+        validate_profile(name, profile)
+    active = registry.get("active")
+    if active is not None and active not in profiles:
+        registry["active"] = None
+    os.chmod(paths.registry, 0o600)
+    return registry
+
+
+def save_registry(paths: Paths, registry: dict[str, Any]) -> None:
+    content = json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(paths.registry, content, 0o600)
+
+
+def dedupe_registry(registry: dict[str, Any]) -> list[tuple[str, str]]:
+    seen: dict[tuple[str, str, str], str] = {}
+    removed: list[tuple[str, str]] = []
+    profiles = registry["profiles"]
+    for name in list(profiles):
+        profile_id = fingerprint(profiles[name])
+        if profile_id not in seen:
+            seen[profile_id] = name
+            continue
+        kept = seen[profile_id]
+        if registry.get("active") == name:
+            registry["active"] = kept
+        del profiles[name]
+        removed.append((name, kept))
+    return removed
+
+
+def parse_toml(text: str, path: Path) -> dict[str, Any]:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise CliError(f"config.toml 解析失败: {path}: {exc}") from exc
+
+
+def read_current(paths: Paths) -> dict[str, Any]:
+    config_text = read_text(paths.config, "Codex 配置")
+    config = parse_toml(config_text, paths.config)
+    provider = config.get("model_provider")
+    if not isinstance(provider, str) or not provider:
+        raise CliError("config.toml 中没有有效的 model_provider")
+    providers = config.get("model_providers")
+    if not isinstance(providers, dict) or not isinstance(providers.get(provider), dict):
+        raise CliError(f"config.toml 中找不到 [model_providers.{provider}] 表")
+    base_url = providers[provider].get("base_url")
+    if not isinstance(base_url, str):
+        raise CliError(f"[model_providers.{provider}] 中没有字符串 base_url")
+    auth = load_json_object(paths.auth, "Codex 凭据")
+    api_key = auth.get(KEY_FIELD)
+    if not isinstance(api_key, str) or not api_key:
+        raise CliError(f"auth.json 中没有有效的 {KEY_FIELD}")
+    return {
+        "provider": provider,
+        "base_url": validate_base_url(base_url),
+        "api_key": validate_api_key(api_key),
+    }
+
+
+def provider_exists(paths: Paths, provider: str) -> bool:
+    config_text = read_text(paths.config, "Codex 配置")
+    config = parse_toml(config_text, paths.config)
+    providers = config.get("model_providers")
+    return isinstance(providers, dict) and isinstance(providers.get(provider), dict)
+
+
+def find_marker_path(value: Any, prefix: tuple[str, ...] = ()) -> tuple[str, ...] | None:
+    if isinstance(value, dict):
+        if value.get("__codex_profile_marker__") == 1:
+            return prefix
+        for key, child in value.items():
+            found = find_marker_path(child, prefix + (str(key),))
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_marker_path(child, prefix)
+            if found is not None:
+                return found
+    return None
+
+
+def section_path(line: str) -> tuple[str, ...] | None:
+    if not line.lstrip().startswith("["):
+        return None
+    try:
+        parsed = tomllib.loads(line.rstrip("\r\n") + "\n__codex_profile_marker__ = 1\n")
+    except tomllib.TOMLDecodeError:
+        return None
+    return find_marker_path(parsed)
+
+
+def render_toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
+def replace_string_assignment(line: str, key: str, value: str) -> str | None:
+    pattern = re.compile(
+        rf'^(\s*{re.escape(key)}\s*=\s*)(?:"(?:\\.|[^"\\])*"|\'[^\']*\')'
+        r'(\s*(?:#.*)?)(\r?\n?)$'
+    )
+    match = pattern.match(line)
+    if not match:
+        return None
+    return f"{match.group(1)}{render_toml_string(value)}{match.group(2)}{match.group(3)}"
+
+
+def update_config_text(text: str, provider: str, base_url: str, path: Path) -> str:
+    lines = text.splitlines(keepends=True)
+    current_section: tuple[str, ...] = ()
+    provider_table_found = False
+    base_url_updated = False
+    model_provider_updated = False
+    insert_at: int | None = None
+
+    for index, line in enumerate(lines):
+        new_section = section_path(line)
+        if new_section is not None:
+            if current_section == ("model_providers", provider) and not base_url_updated:
+                insert_at = index
+            current_section = new_section
+            if current_section == ("model_providers", provider):
+                provider_table_found = True
+            continue
+
+        if current_section == () and not model_provider_updated:
+            replacement = replace_string_assignment(line, "model_provider", provider)
+            if replacement is not None:
+                lines[index] = replacement
+                model_provider_updated = True
+
+        if current_section == ("model_providers", provider) and not base_url_updated:
+            replacement = replace_string_assignment(line, "base_url", base_url)
+            if replacement is not None:
+                lines[index] = replacement
+                base_url_updated = True
+
+    if current_section == ("model_providers", provider) and not base_url_updated:
+        insert_at = len(lines)
+    if not model_provider_updated:
+        raise CliError("无法定位 config.toml 顶层的 model_provider 字符串字段")
+    if not provider_table_found:
+        raise CliError(f"无法定位 config.toml 中的 [model_providers.{provider}] 表")
+    if not base_url_updated:
+        assert insert_at is not None
+        newline = "\r\n" if "\r\n" in text else "\n"
+        lines.insert(insert_at, f"base_url = {render_toml_string(base_url)}{newline}")
+
+    updated = "".join(lines)
+    parsed = parse_toml(updated, path)
+    if parsed.get("model_provider") != provider:
+        raise CliError("内部校验失败：model_provider 未正确更新")
+    actual = parsed.get("model_providers", {}).get(provider, {}).get("base_url")
+    if actual != base_url:
+        raise CliError("内部校验失败：base_url 未正确更新")
+    return updated
+
+
+def backup_live(paths: Paths) -> Path:
+    ensure_private_dir(paths.backups)
+    destination = paths.backups / f"{timestamp()}-{os.getpid()}"
+    destination.mkdir(mode=0o700)
+    for source in (paths.config, paths.auth):
+        if source.exists():
+            target = destination / source.name
+            shutil.copy2(source, target)
+            os.chmod(target, 0o600)
+    return destination
+
+
+def apply_profile(paths: Paths, profile: dict[str, Any]) -> Path:
+    original_config = read_text(paths.config, "Codex 配置")
+    original_auth_text = read_text(paths.auth, "Codex 凭据")
+    config_mode = stat.S_IMODE(paths.config.stat().st_mode)
+    updated_config = update_config_text(
+        original_config, profile["provider"], profile["base_url"], paths.config
+    )
+    try:
+        auth = json.loads(original_auth_text)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"auth.json 解析失败: {paths.auth}: {exc}") from exc
+    if not isinstance(auth, dict):
+        raise CliError("auth.json 顶层必须是 JSON 对象")
+    auth[KEY_FIELD] = profile["api_key"]
+    updated_auth = json.dumps(auth, ensure_ascii=False, indent=2) + "\n"
+
+    backup = backup_live(paths)
+    try:
+        atomic_write_text(paths.config, updated_config, config_mode)
+        atomic_write_text(paths.auth, updated_auth, 0o600)
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        try:
+            atomic_write_text(paths.config, original_config, config_mode)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"config.toml: {rollback_exc}")
+        try:
+            atomic_write_text(paths.auth, original_auth_text, 0o600)
+        except Exception as rollback_exc:
+            rollback_errors.append(f"auth.json: {rollback_exc}")
+        detail = f"；回滚也失败: {', '.join(rollback_errors)}" if rollback_errors else "；已回滚"
+        raise CliError(f"切换配置失败: {exc}{detail}") from exc
+    return backup
+
+
+def unique_auto_name(profiles: dict[str, Any]) -> str:
+    if "current" not in profiles:
+        return "current"
+    base = dt.datetime.now().astimezone().strftime("saved-%Y%m%d-%H%M%S")
+    name = base
+    suffix = 2
+    while name in profiles:
+        name = f"{base}-{suffix}"
+        suffix += 1
+    return name
+
+
+def sync_current(paths: Paths, registry: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    current = read_current(paths)
+    current_id = fingerprint(current)
+    profiles = registry["profiles"]
+    active = registry.get("active")
+    if active in profiles and fingerprint(profiles[active]) == current_id:
+        return current, None
+    for name, profile in profiles.items():
+        if fingerprint(profile) == current_id:
+            registry["active"] = name
+            return current, f"检测到当前文件对应配置 {name!r}，已更新活动标记"
+
+    name = unique_auto_name(profiles)
+    created = now_iso()
+    profiles[name] = {
+        **current,
+        "created_at": created,
+        "updated_at": created,
+        "auto_saved": True,
+    }
+    registry["active"] = name
+    return current, f"已自动保存当前文件为配置 {name!r}"
+
+
+def profile_match(registry: dict[str, Any], candidate: dict[str, Any], exclude: str | None = None) -> str | None:
+    candidate_id = fingerprint(candidate)
+    for name, profile in registry["profiles"].items():
+        if name != exclude and fingerprint(profile) == candidate_id:
+            return name
+    return None
+
+
+def print_profiles(registry: dict[str, Any]) -> None:
+    profiles = registry["profiles"]
+    if not profiles:
+        print("没有已保存的配置")
+        return
+    rows = []
+    for name, profile in profiles.items():
+        rows.append(
+            (
+                "*" if registry.get("active") == name else " ",
+                name,
+                profile["provider"],
+                profile["base_url"],
+                key_id(profile["api_key"]),
+            )
+        )
+    widths = [max(len(str(row[index])) for row in rows) for index in range(3)]
+    print("  名称 / provider / base_url / key-id")
+    for active, name, provider, base_url, identity in rows:
+        print(
+            f"{active} {name:<{widths[1]}}  {provider:<{widths[2]}}  "
+            f"{base_url}  sha256:{identity}"
+        )
+
+
+def resolve_api_key(args: argparse.Namespace, required: bool, prompt: str) -> str | None:
+    literal = getattr(args, "api_key", None)
+    from_stdin = getattr(args, "api_key_stdin", False)
+    env_name = getattr(args, "api_key_env", None)
+    selected = sum([literal is not None, bool(from_stdin), env_name is not None])
+    if selected > 1:
+        raise CliError("--api-key、--api-key-stdin 和 --api-key-env 只能使用一个")
+    if literal is not None:
+        return validate_api_key(literal)
+    if from_stdin:
+        value = sys.stdin.readline()
+        if value == "":
+            raise CliError("标准输入中没有 API key")
+        return validate_api_key(value.rstrip("\r\n"))
+    if env_name is not None:
+        value = os.environ.get(env_name)
+        if value is None:
+            raise CliError(f"环境变量 {env_name!r} 不存在")
+        return validate_api_key(value)
+    if required:
+        return validate_api_key(getpass.getpass(prompt))
+    return None
+
+
+def add_key_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--api-key",
+        help="API key（会进入 shell 历史；更推荐省略本项后隐藏输入）",
+    )
+    parser.add_argument(
+        "--api-key-stdin",
+        action="store_true",
+        help="从标准输入第一行读取 API key",
+    )
+    parser.add_argument(
+        "--api-key-env",
+        metavar="ENV",
+        help="从指定环境变量读取 API key",
+    )
+
+
+def command_save(paths: Paths, registry: dict[str, Any], current: dict[str, Any], name: str) -> None:
+    name = validate_name(name)
+    profiles = registry["profiles"]
+    existing_name = profile_match(registry, current)
+    if name in profiles and fingerprint(profiles[name]) != fingerprint(current):
+        raise CliError(f"名称 {name!r} 已被另一组配置占用")
+    if existing_name is not None and existing_name != name:
+        existing = profiles[existing_name]
+        if existing.get("auto_saved"):
+            existing["auto_saved"] = False
+            existing["updated_at"] = now_iso()
+            profiles[name] = existing
+            del profiles[existing_name]
+            if registry.get("active") == existing_name:
+                registry["active"] = name
+            print(f"已将自动保存的配置 {existing_name!r} 命名为 {name!r}")
+            return
+        raise CliError(f"当前配置已经保存为 {existing_name!r}；去重后未创建 {name!r}")
+    profile = profiles.get(name)
+    if profile is None:
+        created = now_iso()
+        profiles[name] = {
+            **current,
+            "created_at": created,
+            "updated_at": created,
+            "auto_saved": False,
+        }
+    else:
+        profile["auto_saved"] = False
+        profile["updated_at"] = now_iso()
+    registry["active"] = name
+    print(f"当前配置已保存为 {name!r}")
+
+
+def command_add(paths: Paths, registry: dict[str, Any], current: dict[str, Any], args: argparse.Namespace) -> None:
+    name = validate_name(args.name)
+    if name in registry["profiles"]:
+        raise CliError(f"配置名称 {name!r} 已存在；请使用 edit 修改")
+    provider = args.provider or current["provider"]
+    if not provider_exists(paths, provider):
+        raise CliError(f"config.toml 中不存在 model provider {provider!r}")
+    base_url = args.base_url
+    if base_url is None:
+        base_url = input("base_url: ")
+    api_key = resolve_api_key(args, required=True, prompt="API key（隐藏输入）: ")
+    candidate = {
+        "provider": provider,
+        "base_url": validate_base_url(base_url),
+        "api_key": api_key,
+    }
+    duplicate = profile_match(registry, candidate)
+    if duplicate is not None:
+        raise CliError(f"相同配置已经保存为 {duplicate!r}；去重后未新增 {name!r}")
+    created = now_iso()
+    registry["profiles"][name] = {
+        **candidate,
+        "created_at": created,
+        "updated_at": created,
+        "auto_saved": False,
+    }
+    if args.use:
+        backup = apply_profile(paths, registry["profiles"][name])
+        registry["active"] = name
+        print(f"已新增并切换到 {name!r}")
+        print(f"备份: {backup}")
+    else:
+        print(f"已新增配置 {name!r}（尚未切换）")
+
+
+def command_use(paths: Paths, registry: dict[str, Any], name: str) -> None:
+    profiles = registry["profiles"]
+    if name not in profiles:
+        raise CliError(f"配置 {name!r} 不存在")
+    if registry.get("active") == name:
+        print(f"当前已经是 {name!r}")
+        return
+    backup = apply_profile(paths, profiles[name])
+    registry["active"] = name
+    print(f"已切换到 {name!r}")
+    print(f"base_url: {profiles[name]['base_url']}")
+    print(f"key-id: sha256:{key_id(profiles[name]['api_key'])}")
+    print(f"备份: {backup}")
+
+
+def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespace) -> None:
+    profiles = registry["profiles"]
+    if args.name not in profiles:
+        raise CliError(f"配置 {args.name!r} 不存在")
+    old_name = args.name
+    old = profiles[old_name]
+    interactive = not any(
+        [args.new_name, args.provider, args.base_url, args.api_key, args.api_key_stdin, args.api_key_env]
+    )
+    if interactive:
+        entered_name = input(f"名称 [{old_name}]: ").strip()
+        new_name = entered_name or old_name
+        entered_provider = input(f"provider [{old['provider']}]: ").strip()
+        provider = entered_provider or old["provider"]
+        entered_url = input(f"base_url [{old['base_url']}]: ").strip()
+        base_url = entered_url or old["base_url"]
+        entered_key = getpass.getpass("API key（回车保留原值）: ")
+        api_key = validate_api_key(entered_key) if entered_key else old["api_key"]
+    else:
+        new_name = args.new_name or old_name
+        provider = args.provider or old["provider"]
+        base_url = args.base_url or old["base_url"]
+        api_key = resolve_api_key(args, required=False, prompt="") or old["api_key"]
+
+    new_name = validate_name(new_name)
+    if new_name != old_name and new_name in profiles:
+        raise CliError(f"配置名称 {new_name!r} 已存在")
+    if not provider_exists(paths, provider):
+        raise CliError(f"config.toml 中不存在 model provider {provider!r}")
+    candidate = {
+        **old,
+        "provider": provider,
+        "base_url": validate_base_url(base_url),
+        "api_key": validate_api_key(api_key),
+        "updated_at": now_iso(),
+        "auto_saved": False,
+    }
+    duplicate = profile_match(registry, candidate, exclude=old_name)
+    if duplicate is not None:
+        raise CliError(f"修改后会与 {duplicate!r} 重复；未保存修改")
+
+    was_active = registry.get("active") == old_name
+    if was_active and fingerprint(candidate) != fingerprint(old):
+        backup = apply_profile(paths, candidate)
+        print(f"活动配置已同步到 Codex 文件；备份: {backup}")
+    if new_name != old_name:
+        profiles[new_name] = candidate
+        del profiles[old_name]
+    else:
+        profiles[old_name] = candidate
+    if was_active:
+        registry["active"] = new_name
+    print(f"已修改配置 {old_name!r}" + (f" -> {new_name!r}" if new_name != old_name else ""))
+
+
+def command_delete(registry: dict[str, Any], name: str) -> None:
+    profiles = registry["profiles"]
+    if name not in profiles:
+        raise CliError(f"配置 {name!r} 不存在")
+    if registry.get("active") == name:
+        raise CliError("不能删除活动配置；请先 use 切换到另一组配置")
+    del profiles[name]
+    print(f"已删除配置 {name!r}（当前 Codex 文件未改变）")
+
+
+def command_current(registry: dict[str, Any], current: dict[str, Any]) -> None:
+    name = registry.get("active") or "<未命名>"
+    print(f"活动配置: {name}")
+    print(f"provider: {current['provider']}")
+    print(f"base_url: {current['base_url']}")
+    print(f"key-id: sha256:{key_id(current['api_key'])}")
+
+
+def command_backup(paths: Paths) -> None:
+    backup = backup_live(paths)
+    print(f"已备份当前 config.toml 和 auth.json: {backup}")
+
+
+def prompt_yes_no(prompt: str, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        answer = input(f"{prompt} {suffix}: ").strip().lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes", "是"}:
+            return True
+        if answer in {"n", "no", "否"}:
+            return False
+        print("请输入 y 或 n")
+
+
+def choose_profile(
+    registry: dict[str, Any],
+    title: str,
+    *,
+    include_active: bool = True,
+) -> str | None:
+    active = registry.get("active")
+    names = [
+        name
+        for name in registry["profiles"]
+        if include_active or name != active
+    ]
+    if not names:
+        print("没有可选择的配置")
+        return None
+
+    print(f"\n{title}")
+    for index, name in enumerate(names, start=1):
+        profile = registry["profiles"][name]
+        marker = "*" if name == active else " "
+        print(f"  {index}. {marker} {name}  {profile['base_url']}")
+    print("  0. 取消")
+    while True:
+        answer = input("请选择编号: ").strip()
+        if answer in {"", "0", "q", "quit"}:
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1]
+        print(f"请输入 0 到 {len(names)} 之间的编号")
+
+
+def interactive_add(
+    paths: Paths,
+    registry: dict[str, Any],
+    current: dict[str, Any],
+) -> None:
+    print("\n新增配置（直接按 Ctrl-C 可取消）")
+    name = input("名称: ").strip()
+    provider = input(f"provider [{current['provider']}]: ").strip() or current["provider"]
+    base_url = input("base_url: ").strip()
+    api_key = validate_api_key(getpass.getpass("API key（隐藏输入）: "))
+    use_now = prompt_yes_no("新增后立即切换", default=True)
+    args = argparse.Namespace(
+        name=name,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        api_key_stdin=False,
+        api_key_env=None,
+        use=use_now,
+    )
+    command_add(paths, registry, current, args)
+
+
+def interactive_edit(paths: Paths, registry: dict[str, Any]) -> None:
+    name = choose_profile(registry, "选择要修改的配置")
+    if name is None:
+        return
+    args = argparse.Namespace(
+        name=name,
+        new_name=None,
+        provider=None,
+        base_url=None,
+        api_key=None,
+        api_key_stdin=False,
+        api_key_env=None,
+    )
+    command_edit(paths, registry, args)
+
+
+def pause_menu() -> None:
+    try:
+        input("\n按回车键返回菜单...")
+    except EOFError:
+        pass
+
+
+def print_menu_header(registry: dict[str, Any], current: dict[str, Any]) -> None:
+    active = registry.get("active") or "<未命名>"
+    print("\n" + "=" * 64)
+    print("Codex 配置切换器")
+    print(f"当前: {active}  |  {current['base_url']}")
+    print(f"provider: {current['provider']}  |  key-id: sha256:{key_id(current['api_key'])}")
+    print("-" * 64)
+    print("  1. 切换配置")
+    print("  2. 新增配置")
+    print("  3. 修改配置")
+    print("  4. 删除配置")
+    print("  5. 保存或重命名当前配置")
+    print("  6. 查看全部配置")
+    print("  7. 立即备份")
+    print("  0. 退出")
+
+
+def interactive_menu(
+    paths: Paths,
+    registry: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    while True:
+        print_menu_header(registry, current)
+        try:
+            choice = input("请选择操作: ").strip().lower()
+        except EOFError:
+            print("\n输入已结束")
+            return registry
+        if choice in {"0", "q", "quit", "exit"}:
+            print("已退出")
+            return registry
+        if choice not in {"1", "2", "3", "4", "5", "6", "7"}:
+            print("请输入 0 到 7 之间的编号")
+            continue
+
+        working = copy.deepcopy(registry)
+        try:
+            if choice == "1":
+                name = choose_profile(working, "选择要切换到的配置")
+                if name is not None:
+                    command_use(paths, working, name)
+            elif choice == "2":
+                interactive_add(paths, working, current)
+            elif choice == "3":
+                interactive_edit(paths, working)
+            elif choice == "4":
+                name = choose_profile(
+                    working,
+                    "选择要删除的配置",
+                    include_active=False,
+                )
+                if name is not None and prompt_yes_no(f"确认删除 {name!r}", default=False):
+                    command_delete(working, name)
+            elif choice == "5":
+                name = input("当前配置的新名称: ").strip()
+                command_save(paths, working, current, name)
+            elif choice == "6":
+                command_current(working, current)
+                print_profiles(working)
+            elif choice == "7":
+                command_backup(paths)
+
+            dedupe_registry(working)
+            save_registry(paths, working)
+            registry = working
+            current = read_current(paths)
+        except KeyboardInterrupt:
+            print("\n已取消当前操作")
+        except EOFError:
+            print("\n输入已结束")
+            return registry
+        except (CliError, OSError) as exc:
+            print(f"错误: {exc}")
+        pause_menu()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    default_home = os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+    parser = argparse.ArgumentParser(
+        prog="codex-profile",
+        description="保存并快速切换 Codex 的 base_url 与 API key。",
+    )
+    parser.add_argument(
+        "--codex-home",
+        default=default_home,
+        help=f"Codex 配置目录（默认: {default_home}）",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser(
+        "menu",
+        aliases=["interactive"],
+        help="进入交互式菜单（不带子命令时的默认行为）",
+    )
+
+    subparsers.add_parser("list", aliases=["ls"], help="列出配置（不会显示 API key）")
+    subparsers.add_parser("current", aliases=["status"], help="显示当前配置")
+
+    save = subparsers.add_parser("save", help="用名称保存当前 Codex 配置")
+    save.add_argument("name")
+
+    add = subparsers.add_parser("add", help="新增一组配置")
+    add.add_argument("name")
+    add.add_argument("--base-url")
+    add.add_argument("--provider", help="model provider 名称；默认沿用当前 provider")
+    add.add_argument("--use", action="store_true", help="新增后立即切换")
+    add_key_options(add)
+
+    use = subparsers.add_parser("use", aliases=["switch"], help="切换到指定配置")
+    use.add_argument("name")
+
+    edit = subparsers.add_parser("edit", help="修改或重命名配置；无选项时交互编辑")
+    edit.add_argument("name")
+    edit.add_argument("--name", dest="new_name", help="新名称")
+    edit.add_argument("--base-url")
+    edit.add_argument("--provider")
+    add_key_options(edit)
+
+    delete = subparsers.add_parser("delete", aliases=["rm"], help="删除非活动配置")
+    delete.add_argument("name")
+
+    subparsers.add_parser("backup", help="立即备份当前 config.toml 和 auth.json")
+    return parser
+
+
+def run(args: argparse.Namespace) -> None:
+    paths = build_paths(args.codex_home)
+    with locked(paths):
+        if paths.auth.exists():
+            os.chmod(paths.auth, 0o600)
+        registry = load_registry(paths)
+        removed = dedupe_registry(registry)
+        current, sync_message = sync_current(paths, registry)
+        save_registry(paths, registry)
+
+        if sync_message:
+            print(sync_message)
+        for removed_name, kept_name in removed:
+            print(f"已自动去重: 删除 {removed_name!r}，保留 {kept_name!r}")
+
+        if args.command in {None, "menu", "interactive"}:
+            registry = interactive_menu(paths, registry, current)
+        elif args.command in {"list", "ls"}:
+            print_profiles(registry)
+        elif args.command in {"current", "status"}:
+            command_current(registry, current)
+        elif args.command == "save":
+            command_save(paths, registry, current, args.name)
+        elif args.command == "add":
+            command_add(paths, registry, current, args)
+        elif args.command in {"use", "switch"}:
+            command_use(paths, registry, args.name)
+        elif args.command == "edit":
+            command_edit(paths, registry, args)
+        elif args.command in {"delete", "rm"}:
+            command_delete(registry, args.name)
+        elif args.command == "backup":
+            command_backup(paths)
+        else:
+            raise CliError(f"未知命令: {args.command}")
+
+        dedupe_registry(registry)
+        save_registry(paths, registry)
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        run(args)
+    except (CliError, OSError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\n已取消", file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
