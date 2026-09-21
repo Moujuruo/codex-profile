@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import stat
 import sys
 import tempfile
@@ -77,7 +78,13 @@ def locked(paths: Paths) -> Iterator[None]:
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "r+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise CliError(
+                    "另一个 codex-profile 实例正在使用配置；"
+                    "请先在那个终端输入 0 退出后再试"
+                ) from exc
             yield
     finally:
         # fd is owned and closed by fdopen after a successful conversion.
@@ -680,6 +687,12 @@ def command_current(registry: dict[str, Any], current: dict[str, Any]) -> None:
     print(f"key-id: sha256:{key_id(current['api_key'])}")
 
 
+def command_env(registry: dict[str, Any], current: dict[str, Any]) -> None:
+    """Print shell exports for tools that use the standard OpenAI env vars."""
+    print(f"export OPENAI_API_KEY={shlex.quote(current['api_key'])}")
+    print(f"export OPENAI_BASE_URL={shlex.quote(current['base_url'].rstrip('/'))}")
+
+
 def command_backup(paths: Paths) -> None:
     backup = backup_live(paths)
     print(f"已备份当前 config.toml 和 auth.json: {backup}")
@@ -874,6 +887,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("list", aliases=["ls"], help="列出配置（不会显示 API key）")
     subparsers.add_parser("current", aliases=["status"], help="显示当前配置")
+    subparsers.add_parser("env", help="输出当前配置对应的 OpenAI 环境变量")
 
     save = subparsers.add_parser("save", help="用名称保存当前 Codex 配置")
     save.add_argument("name")
@@ -923,6 +937,8 @@ def run(args: argparse.Namespace) -> None:
             print_profiles(registry)
         elif args.command in {"current", "status"}:
             command_current(registry, current)
+        elif args.command == "env":
+            command_env(registry, current)
         elif args.command == "save":
             command_save(paths, registry, current, args.name)
         elif args.command == "add":

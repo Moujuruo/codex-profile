@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+- Return an actionable error immediately when another `codex-profile` instance
+  holds the configuration lock, instead of waiting indefinitely.
+
 ## 1.1.0 - 2026-08-16
 
 - Add a persistent numbered interactive menu as the default interface.

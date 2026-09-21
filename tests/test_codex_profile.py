@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
 import stat
 import subprocess
 import sys
@@ -67,6 +68,7 @@ class CodexProfileTest(unittest.TestCase):
             capture_output=True,
             env=env,
             check=False,
+            timeout=5,
         )
         self.assertEqual(
             result.returncode,
@@ -136,6 +138,19 @@ class CodexProfileTest(unittest.TestCase):
         self.assertEqual(auth["OPENAI_API_KEY"], "sk-test-edited")
         self.assertEqual(auth["other"], "preserved")
 
+    def test_env_exports_active_profile_for_openai_sdk(self) -> None:
+        self.run_cli("save", "original")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--codex-home", str(self.home), "env"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("export OPENAI_BASE_URL=https://original.example/v1", result.stdout)
+        self.assertIn("export OPENAI_API_KEY=sk-test-original", result.stdout)
+
     def test_external_change_is_auto_saved_and_duplicates_are_merged(self) -> None:
         self.run_cli("list")
         registry_path = self.home / "provider-profiles.json"
@@ -202,6 +217,15 @@ class CodexProfileTest(unittest.TestCase):
         self.assertEqual(registry["active"], "current")
         auth = json.loads((self.home / "auth.json").read_text())
         self.assertEqual(auth["OPENAI_API_KEY"], "sk-test-original")
+
+    def test_busy_lock_returns_actionable_error_without_waiting(self) -> None:
+        lock_path = self.home / ".provider-profiles.json.lock"
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            result = self.run_cli("list", expected=2)
+
+        self.assertIn("另一个 codex-profile 实例正在使用配置", result.stderr)
+        self.assertIn("输入 0 退出后再试", result.stderr)
 
     def test_installer_uses_private_home_bin(self) -> None:
         install_home = self.home / "install-home"

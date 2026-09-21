@@ -97,6 +97,7 @@ codex-profile
 ```bash
 codex-profile list
 codex-profile current
+eval "$(codex-profile env)"  # 让 OpenAI SDK/imagegen CLI 使用当前配置
 codex-profile save original
 codex-profile add proxy --base-url https://api.example.com/v1
 codex-profile use proxy
@@ -104,6 +105,11 @@ codex-profile edit proxy
 codex-profile delete proxy
 codex-profile backup
 ```
+
+`codex-profile` 直接修改 Codex 的 `config.toml` 和 `auth.json`。其他使用 OpenAI
+SDK 的工具通常读取环境变量；可用 `eval "$(codex-profile env)"` 将当前活动配置
+导出到当前 shell。该命令会输出用于 `eval` 的 key 环境变量，请只交给受信任的
+shell，避免在共享终端中执行或记录输出。
 
 新增时不传 `--api-key` 会进入隐藏输入。自动化场景建议通过环境变量或标准输入
 传递密钥，避免进入 shell 历史：
@@ -143,6 +149,9 @@ provider-profiles.json
 provider-profile-backups/
 .provider-profiles.json.lock
 ```
+
+同一 `CODEX_HOME` 同时只能运行一个实例。交互菜单尚未退出时，另一个实例会立即
+提示占用情况；回到先启动的菜单输入 `0` 退出后即可继续。
 
 为了完成离线切换，`provider-profiles.json` 和备份中的 `auth.json` 包含明文
 API key。程序将敏感文件设为 `0600`、备份目录设为 `0700`，但这些文件仍应按
