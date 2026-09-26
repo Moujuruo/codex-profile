@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- Save and switch the provider display name (`name`) per profile via
+  `--provider-name` and interactive editing; include it in deduplication and
+  external-change detection.
+- Migrate older profiles using their provider table's current display name,
+  preserving existing local-compaction compatibility settings.
 - Record a per-profile `wire_api` (`responses` or `chat`) and write it to the
   active provider's `[model_providers.<id>]` table on every switch; the line is
   inserted when the table lacks it.

@@ -172,6 +172,20 @@ def validate_wire_api(value: str) -> str:
     return value
 
 
+def validate_provider_name(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CliError("provider_name 必须是非空字符串")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise CliError("provider_name 不能包含控制字符")
+    return value.strip()
+
+
+def provider_display_name(paths: Paths, provider: str) -> str:
+    config = parse_toml(read_text(paths.config, "Codex 配置"), paths.config)
+    table = config.get("model_providers", {}).get(provider, {})
+    return validate_provider_name(table.get("name", provider))
+
+
 def warn_if_chat_wire_api(profile: dict[str, Any]) -> None:
     if profile[WIRE_API_FIELD] != "chat":
         return
@@ -188,9 +202,10 @@ def normalized_url(value: str) -> str:
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
 
 
-def fingerprint(profile: dict[str, Any]) -> tuple[str, str, str, str]:
+def fingerprint(profile: dict[str, Any]) -> tuple[str, str, str, str, str]:
     return (
         profile["provider"],
+        profile["provider_name"],
         normalized_url(profile["base_url"]),
         profile[WIRE_API_FIELD],
         profile["api_key"],
@@ -220,6 +235,8 @@ def validate_profile(name: str, value: Any) -> dict[str, Any]:
         raise CliError(f"配置 {name!r} 的 provider 无效")
     validate_base_url(value["base_url"])
     validate_api_key(value["api_key"])
+    if "provider_name" in value:
+        value["provider_name"] = validate_provider_name(value["provider_name"])
     wire_api = value.get(WIRE_API_FIELD, WIRE_API_DEFAULT)
     if not isinstance(wire_api, str):
         raise CliError(f"配置 {name!r} 的 {WIRE_API_FIELD} 无效")
@@ -241,6 +258,8 @@ def load_registry(paths: Paths) -> dict[str, Any]:
         raise CliError("配置组文件中的 profiles 必须是对象")
     for name, profile in profiles.items():
         validate_profile(name, profile)
+        if "provider_name" not in profile:
+            profile["provider_name"] = provider_display_name(paths, profile["provider"])
     active = registry.get("active")
     if active is not None and active not in profiles:
         registry["active"] = None
@@ -254,7 +273,7 @@ def save_registry(paths: Paths, registry: dict[str, Any]) -> None:
 
 
 def dedupe_registry(registry: dict[str, Any]) -> list[tuple[str, str]]:
-    seen: dict[tuple[str, str, str, str], str] = {}
+    seen: dict[tuple[str, str, str, str, str], str] = {}
     removed: list[tuple[str, str]] = []
     profiles = registry["profiles"]
     for name in list(profiles):
@@ -292,12 +311,14 @@ def read_current(paths: Paths) -> dict[str, Any]:
     wire_api = providers[provider].get(WIRE_API_FIELD, WIRE_API_DEFAULT)
     if not isinstance(wire_api, str):
         raise CliError(f"[model_providers.{provider}] 中的 {WIRE_API_FIELD} 必须是字符串")
+    provider_name = providers[provider].get("name", provider)
     auth = load_json_object(paths.auth, "Codex 凭据")
     api_key = auth.get(KEY_FIELD)
     if not isinstance(api_key, str) or not api_key:
         raise CliError(f"auth.json 中没有有效的 {KEY_FIELD}")
     return {
         "provider": provider,
+        "provider_name": validate_provider_name(provider_name),
         "base_url": validate_base_url(base_url),
         WIRE_API_FIELD: validate_wire_api(wire_api),
         "api_key": validate_api_key(api_key),
@@ -357,12 +378,13 @@ def update_config_text(
     provider: str,
     base_url: str,
     wire_api: str,
+    provider_name: str,
     path: Path,
 ) -> str:
     lines = text.splitlines(keepends=True)
     current_section: tuple[str, ...] = ()
     provider_table_found = False
-    pending = {"base_url": base_url, WIRE_API_FIELD: wire_api}
+    pending = {"base_url": base_url, WIRE_API_FIELD: wire_api, "name": provider_name}
     model_provider_updated = False
     insert_at: int | None = None
 
@@ -414,6 +436,8 @@ def update_config_text(
         raise CliError("内部校验失败：base_url 未正确更新")
     if provider_table.get(WIRE_API_FIELD) != wire_api:
         raise CliError("内部校验失败：wire_api 未正确更新")
+    if provider_table.get("name") != provider_name:
+        raise CliError("内部校验失败：provider name 未正确更新")
     return updated
 
 
@@ -439,6 +463,7 @@ def apply_profile(paths: Paths, profile: dict[str, Any]) -> Path:
         profile["provider"],
         profile["base_url"],
         profile[WIRE_API_FIELD],
+        profile["provider_name"],
         paths.config,
     )
     try:
@@ -525,17 +550,18 @@ def print_profiles(registry: dict[str, Any]) -> None:
                 "*" if registry.get("active") == name else " ",
                 name,
                 profile["provider"],
+                profile["provider_name"],
                 profile["base_url"],
                 profile[WIRE_API_FIELD],
                 key_id(profile["api_key"]),
             )
         )
-    widths = [max(len(str(row[index])) for row in rows) for index in range(5)]
-    print("  名称 / provider / base_url / wire_api / key-id")
-    for active, name, provider, base_url, wire_api, identity in rows:
+    widths = [max(len(str(row[index])) for row in rows) for index in range(6)]
+    print("  名称 / provider / provider_name / base_url / wire_api / key-id")
+    for active, name, provider, provider_name, base_url, wire_api, identity in rows:
         print(
             f"{active} {name:<{widths[1]}}  {provider:<{widths[2]}}  "
-            f"{base_url}  {wire_api:<{widths[4]}}  sha256:{identity}"
+            f"{provider_name}  {base_url}  {wire_api:<{widths[5]}}  sha256:{identity}"
         )
 
 
@@ -624,10 +650,13 @@ def command_add(paths: Paths, registry: dict[str, Any], current: dict[str, Any],
     base_url = args.base_url
     if base_url is None:
         base_url = input("base_url: ")
+    provider_name = (args.provider_name if args.provider_name is not None
+                     else provider_display_name(paths, provider))
     wire_api = args.wire_api or current[WIRE_API_FIELD]
     api_key = resolve_api_key(args, required=True, prompt="API key（隐藏输入）: ")
     candidate = {
         "provider": provider,
+        "provider_name": validate_provider_name(provider_name),
         "base_url": validate_base_url(base_url),
         WIRE_API_FIELD: validate_wire_api(wire_api),
         "api_key": api_key,
@@ -663,6 +692,7 @@ def command_use(paths: Paths, registry: dict[str, Any], name: str) -> None:
     registry["active"] = name
     print(f"已切换到 {name!r}")
     print(f"base_url: {profiles[name]['base_url']}")
+    print(f"provider_name: {profiles[name]['provider_name']}")
     print(f"wire_api: {profiles[name][WIRE_API_FIELD]}")
     print(f"key-id: sha256:{key_id(profiles[name]['api_key'])}")
     print(f"备份: {backup}")
@@ -678,6 +708,7 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
         [
             args.new_name,
             args.provider,
+            args.provider_name is not None,
             args.base_url,
             args.wire_api,
             args.api_key,
@@ -690,6 +721,9 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
         new_name = entered_name or old_name
         entered_provider = input(f"provider [{old['provider']}]: ").strip()
         provider = entered_provider or old["provider"]
+        default_provider_name = (old["provider_name"] if provider == old["provider"]
+                                 else provider_display_name(paths, provider))
+        provider_name = input(f"provider 显示名 [{default_provider_name}]: ").strip() or default_provider_name
         entered_url = input(f"base_url [{old['base_url']}]: ").strip()
         base_url = entered_url or old["base_url"]
         entered_wire_api = input(
@@ -701,6 +735,9 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
     else:
         new_name = args.new_name or old_name
         provider = args.provider or old["provider"]
+        provider_name = (args.provider_name if args.provider_name is not None else
+                         old["provider_name"] if provider == old["provider"] else
+                         provider_display_name(paths, provider))
         base_url = args.base_url or old["base_url"]
         wire_api = args.wire_api or old[WIRE_API_FIELD]
         api_key = resolve_api_key(args, required=False, prompt="") or old["api_key"]
@@ -713,6 +750,7 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
     candidate = {
         **old,
         "provider": provider,
+        "provider_name": validate_provider_name(provider_name),
         "base_url": validate_base_url(base_url),
         WIRE_API_FIELD: validate_wire_api(wire_api),
         "api_key": validate_api_key(api_key),
@@ -755,6 +793,7 @@ def command_current(registry: dict[str, Any], current: dict[str, Any]) -> None:
     name = registry.get("active") or "<未命名>"
     print(f"活动配置: {name}")
     print(f"provider: {current['provider']}")
+    print(f"provider_name: {current['provider_name']}")
     print(f"base_url: {current['base_url']}")
     print(f"wire_api: {current[WIRE_API_FIELD]}")
     print(f"key-id: sha256:{key_id(current['api_key'])}")
@@ -823,6 +862,8 @@ def interactive_add(
     print("\n新增配置（直接按 Ctrl-C 可取消）")
     name = input("名称: ").strip()
     provider = input(f"provider [{current['provider']}]: ").strip() or current["provider"]
+    default_provider_name = provider_display_name(paths, provider)
+    provider_name = input(f"provider 显示名 [{default_provider_name}]: ").strip() or default_provider_name
     base_url = input("base_url: ").strip()
     wire_api = (
         input(f"wire_api ({'/'.join(WIRE_API_VALUES)}) [{current[WIRE_API_FIELD]}]: ").strip()
@@ -833,6 +874,7 @@ def interactive_add(
     args = argparse.Namespace(
         name=name,
         provider=provider,
+        provider_name=provider_name,
         base_url=base_url,
         wire_api=wire_api,
         api_key=api_key,
@@ -851,6 +893,7 @@ def interactive_edit(paths: Paths, registry: dict[str, Any]) -> None:
         name=name,
         new_name=None,
         provider=None,
+        provider_name=None,
         base_url=None,
         wire_api=None,
         api_key=None,
@@ -873,7 +916,7 @@ def print_menu_header(registry: dict[str, Any], current: dict[str, Any]) -> None
     print("Codex 配置切换器")
     print(f"当前: {active}  |  {current['base_url']}")
     print(
-        f"provider: {current['provider']}  |  wire_api: {current[WIRE_API_FIELD]}  "
+        f"provider: {current['provider']} ({current['provider_name']})  |  wire_api: {current[WIRE_API_FIELD]}  "
         f"|  key-id: sha256:{key_id(current['api_key'])}"
     )
     print("-" * 64)
@@ -983,6 +1026,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(WIRE_API_VALUES),
         help="API 模式（responses 或 chat）；默认沿用当前值",
     )
+    add.add_argument("--provider-name", help="provider 显示名；默认读取目标 provider 表的 name")
     add.add_argument("--use", action="store_true", help="新增后立即切换")
     add_key_options(add)
 
@@ -994,6 +1038,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--name", dest="new_name", help="新名称")
     edit.add_argument("--base-url")
     edit.add_argument("--provider")
+    edit.add_argument("--provider-name", help="provider 显示名，写入表内 name 字段")
     edit.add_argument("--wire-api", choices=list(WIRE_API_VALUES))
     add_key_options(edit)
 

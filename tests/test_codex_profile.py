@@ -178,6 +178,7 @@ class CodexProfileTest(unittest.TestCase):
                 "2",
                 "proxy",
                 "",
+                "",
                 "https://proxy.example/v1",
                 "",
                 "sk-test-proxy",
@@ -186,6 +187,7 @@ class CodexProfileTest(unittest.TestCase):
                 "3",
                 "2",
                 "proxy2",
+                "",
                 "",
                 "https://edited.example/v1",
                 "",
@@ -318,6 +320,75 @@ class CodexProfileTest(unittest.TestCase):
         self.assertTrue(registry["profiles"])
         for profile in registry["profiles"].values():
             self.assertEqual(profile["wire_api"], "responses")
+
+    def test_provider_name_switch_edit_and_dedup(self) -> None:
+        self.run_cli("save", "original")
+        self.run_cli(
+            "add", "local", "--base-url", "https://original.example/v1",
+            "--provider-name", "Kuwernv", "--api-key-stdin", "--use",
+            input_text="sk-test-original\n",
+        )
+        config_path = self.home / "config.toml"
+        self.assertEqual(tomllib.loads(config_path.read_text())["model_providers"]["OpenAI"]["name"], "Kuwernv")
+        self.assertEqual(set(self.load_registry()["profiles"]), {"original", "local"})
+        self.assertIn("provider_name: Kuwernv", self.run_cli("current").stdout)
+        self.assertIn("Kuwernv", self.run_cli("list").stdout)
+        self.run_cli("use", "original")
+        self.assertEqual(tomllib.loads(config_path.read_text())["model_providers"]["OpenAI"]["name"], "OpenAI")
+        self.run_cli("use", "local")
+        self.run_cli("edit", "local", "--provider-name", 'Proxy "Local"')
+        config = tomllib.loads(config_path.read_text())
+        self.assertEqual(config["model_providers"]["OpenAI"]["name"], 'Proxy "Local"')
+        self.assertEqual(config["model_providers"]["OpenAI"]["wire_api"], "responses")
+        self.assertTrue(config["features"]["memories"])
+        self.run_cli("edit", "local", "--provider-name", "OpenAI", expected=2)
+        self.assertEqual(self.load_registry()["profiles"]["local"]["provider_name"], 'Proxy "Local"')
+
+    def test_legacy_provider_name_inherits_each_provider_table(self) -> None:
+        self.run_cli("save", "original")
+        path = self.home / "config.toml"
+        path.write_text(path.read_text().replace('name = "OpenAI"', 'name = "Kuwernv"') +
+                        '\n[model_providers.Other]\nname = "Other Proxy"\nbase_url = "https://other.example/v1"\n')
+        registry = self.load_registry()
+        registry["profiles"]["other"] = {**registry["profiles"]["original"], "provider": "Other"}
+        for profile in registry["profiles"].values():
+            profile.pop("provider_name", None)
+        (self.home / "provider-profiles.json").write_text(json.dumps(registry))
+        before = path.read_bytes()
+        self.run_cli("list")
+        migrated = self.load_registry()
+        self.assertEqual(migrated["active"], "original")
+        self.assertEqual(set(migrated["profiles"]), {"original", "other"})
+        self.assertEqual(migrated["profiles"]["original"]["provider_name"], "Kuwernv")
+        self.assertEqual(migrated["profiles"]["other"]["provider_name"], "Other Proxy")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_external_provider_name_change_is_saved(self) -> None:
+        self.run_cli("save", "original")
+        path = self.home / "config.toml"
+        path.write_text(path.read_text().replace('name = "OpenAI"', 'name = "Kuwernv"'))
+        self.run_cli("list")
+        registry = self.load_registry()
+        self.assertEqual(len(registry["profiles"]), 2)
+        self.assertEqual(registry["profiles"][registry["active"]]["provider_name"], "Kuwernv")
+        self.run_cli("use", "original")
+        self.assertEqual(tomllib.loads(path.read_text())["model_providers"]["OpenAI"]["name"], "OpenAI")
+
+    def test_provider_name_inserted_when_missing_at_eof(self) -> None:
+        path = self.home / "config.toml"
+        path.write_text('model_provider = "OpenAI"\n[model_providers.OpenAI]\nbase_url = "https://original.example/v1"')
+        self.run_cli("save", "original")
+        self.run_cli("edit", "original", "--provider-name", "Kuwernv")
+        self.assertEqual(tomllib.loads(path.read_text())["model_providers"]["OpenAI"]["name"], "Kuwernv")
+
+    def test_invalid_provider_name_does_not_change_live_config(self) -> None:
+        self.run_cli("save", "original")
+        path = self.home / "config.toml"
+        before = path.read_bytes()
+        for value in ["", "  ", "bad\nname", "bad\x1bname"]:
+            with self.subTest(value=value):
+                self.run_cli("edit", "original", "--provider-name", value, expected=2)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_invalid_wire_api_is_rejected(self) -> None:
         result = self.run_cli(
