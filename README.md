@@ -1,7 +1,7 @@
 # codex-profile
 
 一个无 Web UI、无第三方依赖的 Codex 配置切换器，用于保存和切换
-`config.toml` 中的 `base_url` 与 `auth.json` 中的 API key。
+`config.toml` 中的 `base_url`、`wire_api` 与 `auth.json` 中的 API key。
 
 直接运行 `codex-profile` 会进入中文交互菜单；原子命令仍可用于脚本和自动化。
 
@@ -9,7 +9,8 @@
 
 - 首次运行自动保存当前 Codex 配置
 - 交互式新增、切换、修改、重命名和删除配置
-- 按 `provider + base_url + API key` 自动去重
+- 每组配置记录 `wire_api`（`responses` 或 `chat`），切换时同步写入 `config.toml`
+- 按 `provider + base_url + wire_api + API key` 自动去重
 - 检测并自动保存外部手工修改
 - 切换前自动备份 `config.toml` 和 `auth.json`
 - 原子写入，失败时尝试回滚
@@ -32,7 +33,7 @@ Windows 用户可以在 WSL 中运行。当前版本依赖 Unix 的 `fcntl` 文�
 
 ### 从 GitHub Release 安装
 
-下载固定版本和校验和：
+下载已发布的固定版本和校验和（`v1.1.0`；本文所述 `wire_api` 功能需从源码安装，等待后续 Release）：
 
 ```bash
 version=v1.1.0
@@ -100,11 +101,22 @@ codex-profile current
 eval "$(codex-profile env)"  # 让 OpenAI SDK/imagegen CLI 使用当前配置
 codex-profile save original
 codex-profile add proxy --base-url https://api.example.com/v1
+codex-profile add chat-proxy --base-url https://chat.example.com/v1 --wire-api chat
 codex-profile use proxy
 codex-profile edit proxy
 codex-profile delete proxy
 codex-profile backup
 ```
+
+每组配置都会记录 `wire_api`：`responses`（默认值，对应 Responses API）或
+`chat`（对应 Chat Completions API）。切换配置时会把它写入当前 provider 的
+`[model_providers.<id>]` 表；表中缺少该字段时会自动补上。旧版本保存的配置
+没有此字段，加载时按 `responses` 处理，可用 `codex-profile edit <名称>
+--wire-api chat` 修改。新增配置不传 `--wire-api` 时沿用当前值。
+
+注意：当前版本的 Codex 已移除对 `wire_api = "chat"` 的支持，配置后启动会直接
+报错（见 [openai/codex#7782](https://github.com/openai/codex/discussions/7782)）。
+`chat` 仅对旧版本 Codex 有意义，使用 chat 配置时程序会向 stderr 打印警告。
 
 `codex-profile` 直接修改 Codex 的 `config.toml` 和 `auth.json`。其他使用 OpenAI
 SDK 的工具通常读取环境变量；可用 `eval "$(codex-profile env)"` 将当前活动配置

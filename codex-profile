@@ -25,11 +25,15 @@ from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REGISTRY_VERSION = 1
 REGISTRY_NAME = "provider-profiles.json"
 BACKUP_DIR_NAME = "provider-profile-backups"
 KEY_FIELD = "OPENAI_API_KEY"
+WIRE_API_FIELD = "wire_api"
+WIRE_API_DEFAULT = "responses"
+WIRE_API_VALUES = (WIRE_API_DEFAULT, "chat")
+CHAT_REMOVED_URL = "https://github.com/openai/codex/discussions/7782"
 
 
 class CliError(Exception):
@@ -161,16 +165,34 @@ def validate_api_key(value: str) -> str:
     return value.strip()
 
 
+def validate_wire_api(value: str) -> str:
+    value = value.strip()
+    if value not in WIRE_API_VALUES:
+        raise CliError(f"wire_api 必须是 {' 或 '.join(WIRE_API_VALUES)}")
+    return value
+
+
+def warn_if_chat_wire_api(profile: dict[str, Any]) -> None:
+    if profile[WIRE_API_FIELD] != "chat":
+        return
+    print(
+        '警告: 当前版本的 Codex 已移除 wire_api = "chat"，启动会报错；'
+        f"仅旧版本 Codex 可用，详见 {CHAT_REMOVED_URL}",
+        file=sys.stderr,
+    )
+
+
 def normalized_url(value: str) -> str:
     parsed = urlsplit(value.strip())
     path = parsed.path.rstrip("/")
     return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
 
 
-def fingerprint(profile: dict[str, Any]) -> tuple[str, str, str]:
+def fingerprint(profile: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         profile["provider"],
         normalized_url(profile["base_url"]),
+        profile[WIRE_API_FIELD],
         profile["api_key"],
     )
 
@@ -198,6 +220,10 @@ def validate_profile(name: str, value: Any) -> dict[str, Any]:
         raise CliError(f"配置 {name!r} 的 provider 无效")
     validate_base_url(value["base_url"])
     validate_api_key(value["api_key"])
+    wire_api = value.get(WIRE_API_FIELD, WIRE_API_DEFAULT)
+    if not isinstance(wire_api, str):
+        raise CliError(f"配置 {name!r} 的 {WIRE_API_FIELD} 无效")
+    value[WIRE_API_FIELD] = validate_wire_api(wire_api)
     return value
 
 
@@ -228,7 +254,7 @@ def save_registry(paths: Paths, registry: dict[str, Any]) -> None:
 
 
 def dedupe_registry(registry: dict[str, Any]) -> list[tuple[str, str]]:
-    seen: dict[tuple[str, str, str], str] = {}
+    seen: dict[tuple[str, str, str, str], str] = {}
     removed: list[tuple[str, str]] = []
     profiles = registry["profiles"]
     for name in list(profiles):
@@ -263,6 +289,9 @@ def read_current(paths: Paths) -> dict[str, Any]:
     base_url = providers[provider].get("base_url")
     if not isinstance(base_url, str):
         raise CliError(f"[model_providers.{provider}] 中没有字符串 base_url")
+    wire_api = providers[provider].get(WIRE_API_FIELD, WIRE_API_DEFAULT)
+    if not isinstance(wire_api, str):
+        raise CliError(f"[model_providers.{provider}] 中的 {WIRE_API_FIELD} 必须是字符串")
     auth = load_json_object(paths.auth, "Codex 凭据")
     api_key = auth.get(KEY_FIELD)
     if not isinstance(api_key, str) or not api_key:
@@ -270,6 +299,7 @@ def read_current(paths: Paths) -> dict[str, Any]:
     return {
         "provider": provider,
         "base_url": validate_base_url(base_url),
+        WIRE_API_FIELD: validate_wire_api(wire_api),
         "api_key": validate_api_key(api_key),
     }
 
@@ -322,18 +352,24 @@ def replace_string_assignment(line: str, key: str, value: str) -> str | None:
     return f"{match.group(1)}{render_toml_string(value)}{match.group(2)}{match.group(3)}"
 
 
-def update_config_text(text: str, provider: str, base_url: str, path: Path) -> str:
+def update_config_text(
+    text: str,
+    provider: str,
+    base_url: str,
+    wire_api: str,
+    path: Path,
+) -> str:
     lines = text.splitlines(keepends=True)
     current_section: tuple[str, ...] = ()
     provider_table_found = False
-    base_url_updated = False
+    pending = {"base_url": base_url, WIRE_API_FIELD: wire_api}
     model_provider_updated = False
     insert_at: int | None = None
 
     for index, line in enumerate(lines):
         new_section = section_path(line)
         if new_section is not None:
-            if current_section == ("model_providers", provider) and not base_url_updated:
+            if current_section == ("model_providers", provider) and pending:
                 insert_at = index
             current_section = new_section
             if current_section == ("model_providers", provider):
@@ -346,30 +382,38 @@ def update_config_text(text: str, provider: str, base_url: str, path: Path) -> s
                 lines[index] = replacement
                 model_provider_updated = True
 
-        if current_section == ("model_providers", provider) and not base_url_updated:
-            replacement = replace_string_assignment(line, "base_url", base_url)
-            if replacement is not None:
-                lines[index] = replacement
-                base_url_updated = True
+        if current_section == ("model_providers", provider):
+            for key in list(pending):
+                replacement = replace_string_assignment(line, key, pending[key])
+                if replacement is not None:
+                    lines[index] = replacement
+                    del pending[key]
 
-    if current_section == ("model_providers", provider) and not base_url_updated:
+    if current_section == ("model_providers", provider) and pending:
         insert_at = len(lines)
     if not model_provider_updated:
         raise CliError("无法定位 config.toml 顶层的 model_provider 字符串字段")
     if not provider_table_found:
         raise CliError(f"无法定位 config.toml 中的 [model_providers.{provider}] 表")
-    if not base_url_updated:
+    if pending:
         assert insert_at is not None
         newline = "\r\n" if "\r\n" in text else "\n"
-        lines.insert(insert_at, f"base_url = {render_toml_string(base_url)}{newline}")
+        if insert_at > 0 and not lines[insert_at - 1].endswith("\n"):
+            lines[insert_at - 1] += newline
+        lines[insert_at:insert_at] = [
+            f"{key} = {render_toml_string(value)}{newline}"
+            for key, value in pending.items()
+        ]
 
     updated = "".join(lines)
     parsed = parse_toml(updated, path)
     if parsed.get("model_provider") != provider:
         raise CliError("内部校验失败：model_provider 未正确更新")
-    actual = parsed.get("model_providers", {}).get(provider, {}).get("base_url")
-    if actual != base_url:
+    provider_table = parsed.get("model_providers", {}).get(provider, {})
+    if provider_table.get("base_url") != base_url:
         raise CliError("内部校验失败：base_url 未正确更新")
+    if provider_table.get(WIRE_API_FIELD) != wire_api:
+        raise CliError("内部校验失败：wire_api 未正确更新")
     return updated
 
 
@@ -386,11 +430,16 @@ def backup_live(paths: Paths) -> Path:
 
 
 def apply_profile(paths: Paths, profile: dict[str, Any]) -> Path:
+    warn_if_chat_wire_api(profile)
     original_config = read_text(paths.config, "Codex 配置")
     original_auth_text = read_text(paths.auth, "Codex 凭据")
     config_mode = stat.S_IMODE(paths.config.stat().st_mode)
     updated_config = update_config_text(
-        original_config, profile["provider"], profile["base_url"], paths.config
+        original_config,
+        profile["provider"],
+        profile["base_url"],
+        profile[WIRE_API_FIELD],
+        paths.config,
     )
     try:
         auth = json.loads(original_auth_text)
@@ -477,15 +526,16 @@ def print_profiles(registry: dict[str, Any]) -> None:
                 name,
                 profile["provider"],
                 profile["base_url"],
+                profile[WIRE_API_FIELD],
                 key_id(profile["api_key"]),
             )
         )
-    widths = [max(len(str(row[index])) for row in rows) for index in range(3)]
-    print("  名称 / provider / base_url / key-id")
-    for active, name, provider, base_url, identity in rows:
+    widths = [max(len(str(row[index])) for row in rows) for index in range(5)]
+    print("  名称 / provider / base_url / wire_api / key-id")
+    for active, name, provider, base_url, wire_api, identity in rows:
         print(
             f"{active} {name:<{widths[1]}}  {provider:<{widths[2]}}  "
-            f"{base_url}  sha256:{identity}"
+            f"{base_url}  {wire_api:<{widths[4]}}  sha256:{identity}"
         )
 
 
@@ -574,10 +624,12 @@ def command_add(paths: Paths, registry: dict[str, Any], current: dict[str, Any],
     base_url = args.base_url
     if base_url is None:
         base_url = input("base_url: ")
+    wire_api = args.wire_api or current[WIRE_API_FIELD]
     api_key = resolve_api_key(args, required=True, prompt="API key（隐藏输入）: ")
     candidate = {
         "provider": provider,
         "base_url": validate_base_url(base_url),
+        WIRE_API_FIELD: validate_wire_api(wire_api),
         "api_key": api_key,
     }
     duplicate = profile_match(registry, candidate)
@@ -596,6 +648,7 @@ def command_add(paths: Paths, registry: dict[str, Any], current: dict[str, Any],
         print(f"已新增并切换到 {name!r}")
         print(f"备份: {backup}")
     else:
+        warn_if_chat_wire_api(registry["profiles"][name])
         print(f"已新增配置 {name!r}（尚未切换）")
 
 
@@ -610,6 +663,7 @@ def command_use(paths: Paths, registry: dict[str, Any], name: str) -> None:
     registry["active"] = name
     print(f"已切换到 {name!r}")
     print(f"base_url: {profiles[name]['base_url']}")
+    print(f"wire_api: {profiles[name][WIRE_API_FIELD]}")
     print(f"key-id: sha256:{key_id(profiles[name]['api_key'])}")
     print(f"备份: {backup}")
 
@@ -621,7 +675,15 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
     old_name = args.name
     old = profiles[old_name]
     interactive = not any(
-        [args.new_name, args.provider, args.base_url, args.api_key, args.api_key_stdin, args.api_key_env]
+        [
+            args.new_name,
+            args.provider,
+            args.base_url,
+            args.wire_api,
+            args.api_key,
+            args.api_key_stdin,
+            args.api_key_env,
+        ]
     )
     if interactive:
         entered_name = input(f"名称 [{old_name}]: ").strip()
@@ -630,12 +692,17 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
         provider = entered_provider or old["provider"]
         entered_url = input(f"base_url [{old['base_url']}]: ").strip()
         base_url = entered_url or old["base_url"]
+        entered_wire_api = input(
+            f"wire_api ({'/'.join(WIRE_API_VALUES)}) [{old[WIRE_API_FIELD]}]: "
+        ).strip()
+        wire_api = entered_wire_api or old[WIRE_API_FIELD]
         entered_key = getpass.getpass("API key（回车保留原值）: ")
         api_key = validate_api_key(entered_key) if entered_key else old["api_key"]
     else:
         new_name = args.new_name or old_name
         provider = args.provider or old["provider"]
         base_url = args.base_url or old["base_url"]
+        wire_api = args.wire_api or old[WIRE_API_FIELD]
         api_key = resolve_api_key(args, required=False, prompt="") or old["api_key"]
 
     new_name = validate_name(new_name)
@@ -647,6 +714,7 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
         **old,
         "provider": provider,
         "base_url": validate_base_url(base_url),
+        WIRE_API_FIELD: validate_wire_api(wire_api),
         "api_key": validate_api_key(api_key),
         "updated_at": now_iso(),
         "auto_saved": False,
@@ -656,9 +724,13 @@ def command_edit(paths: Paths, registry: dict[str, Any], args: argparse.Namespac
         raise CliError(f"修改后会与 {duplicate!r} 重复；未保存修改")
 
     was_active = registry.get("active") == old_name
+    applied = False
     if was_active and fingerprint(candidate) != fingerprint(old):
         backup = apply_profile(paths, candidate)
+        applied = True
         print(f"活动配置已同步到 Codex 文件；备份: {backup}")
+    if not applied:
+        warn_if_chat_wire_api(candidate)
     if new_name != old_name:
         profiles[new_name] = candidate
         del profiles[old_name]
@@ -684,6 +756,7 @@ def command_current(registry: dict[str, Any], current: dict[str, Any]) -> None:
     print(f"活动配置: {name}")
     print(f"provider: {current['provider']}")
     print(f"base_url: {current['base_url']}")
+    print(f"wire_api: {current[WIRE_API_FIELD]}")
     print(f"key-id: sha256:{key_id(current['api_key'])}")
 
 
@@ -751,12 +824,17 @@ def interactive_add(
     name = input("名称: ").strip()
     provider = input(f"provider [{current['provider']}]: ").strip() or current["provider"]
     base_url = input("base_url: ").strip()
+    wire_api = (
+        input(f"wire_api ({'/'.join(WIRE_API_VALUES)}) [{current[WIRE_API_FIELD]}]: ").strip()
+        or current[WIRE_API_FIELD]
+    )
     api_key = validate_api_key(getpass.getpass("API key（隐藏输入）: "))
     use_now = prompt_yes_no("新增后立即切换", default=True)
     args = argparse.Namespace(
         name=name,
         provider=provider,
         base_url=base_url,
+        wire_api=wire_api,
         api_key=api_key,
         api_key_stdin=False,
         api_key_env=None,
@@ -774,6 +852,7 @@ def interactive_edit(paths: Paths, registry: dict[str, Any]) -> None:
         new_name=None,
         provider=None,
         base_url=None,
+        wire_api=None,
         api_key=None,
         api_key_stdin=False,
         api_key_env=None,
@@ -793,7 +872,10 @@ def print_menu_header(registry: dict[str, Any], current: dict[str, Any]) -> None
     print("\n" + "=" * 64)
     print("Codex 配置切换器")
     print(f"当前: {active}  |  {current['base_url']}")
-    print(f"provider: {current['provider']}  |  key-id: sha256:{key_id(current['api_key'])}")
+    print(
+        f"provider: {current['provider']}  |  wire_api: {current[WIRE_API_FIELD]}  "
+        f"|  key-id: sha256:{key_id(current['api_key'])}"
+    )
     print("-" * 64)
     print("  1. 切换配置")
     print("  2. 新增配置")
@@ -896,6 +978,11 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("name")
     add.add_argument("--base-url")
     add.add_argument("--provider", help="model provider 名称；默认沿用当前 provider")
+    add.add_argument(
+        "--wire-api",
+        choices=list(WIRE_API_VALUES),
+        help="API 模式（responses 或 chat）；默认沿用当前值",
+    )
     add.add_argument("--use", action="store_true", help="新增后立即切换")
     add_key_options(add)
 
@@ -907,6 +994,7 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--name", dest="new_name", help="新名称")
     edit.add_argument("--base-url")
     edit.add_argument("--provider")
+    edit.add_argument("--wire-api", choices=list(WIRE_API_VALUES))
     add_key_options(edit)
 
     delete = subparsers.add_parser("delete", aliases=["rm"], help="删除非活动配置")

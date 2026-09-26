@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- Record a per-profile `wire_api` (`responses` or `chat`) and write it to the
+  active provider's `[model_providers.<id>]` table on every switch; the line is
+  inserted when the table lacks it.
+- Add `--wire-api` to `add` and `edit`, show `wire_api` in `list`, `current`,
+  `use`, and the interactive menu, and include it in dedup/auto-save matching.
+- Profiles saved by older versions default to `responses` on load.
+- Insert missing provider fields correctly when `config.toml` has no final
+  newline.
+- Warn on stderr when a profile uses `wire_api = "chat"`, which current Codex
+  releases reject at startup (openai/codex#7782); `chat` only works with older
+  Codex versions.
 - Return an actionable error immediately when another `codex-profile` instance
   holds the configuration lock, instead of waiting indefinitely.
 

@@ -179,6 +179,7 @@ class CodexProfileTest(unittest.TestCase):
                 "proxy",
                 "",
                 "https://proxy.example/v1",
+                "",
                 "sk-test-proxy",
                 "n",
                 "",
@@ -187,6 +188,7 @@ class CodexProfileTest(unittest.TestCase):
                 "proxy2",
                 "",
                 "https://edited.example/v1",
+                "",
                 "",
                 "",
                 "1",
@@ -217,6 +219,119 @@ class CodexProfileTest(unittest.TestCase):
         self.assertEqual(registry["active"], "current")
         auth = json.loads((self.home / "auth.json").read_text())
         self.assertEqual(auth["OPENAI_API_KEY"], "sk-test-original")
+
+    def test_wire_api_switching(self) -> None:
+        self.run_cli("save", "original")
+        result = self.run_cli(
+            "add",
+            "chatproxy",
+            "--base-url",
+            "https://chat.example/v1",
+            "--wire-api",
+            "chat",
+            "--api-key-stdin",
+            "--use",
+            input_text="sk-test-proxy\n",
+        )
+        self.assertIn('wire_api = "chat"', result.stderr)
+        config = tomllib.loads((self.home / "config.toml").read_text())
+        provider = config["model_providers"]["OpenAI"]
+        self.assertEqual(provider["base_url"], "https://chat.example/v1")
+        self.assertEqual(provider["wire_api"], "chat")
+
+        result = self.run_cli("use", "original")
+        self.assertIn("wire_api: responses", result.stdout)
+        config = tomllib.loads((self.home / "config.toml").read_text())
+        provider = config["model_providers"]["OpenAI"]
+        self.assertEqual(provider["base_url"], "https://original.example/v1")
+        self.assertEqual(provider["wire_api"], "responses")
+
+        result = self.run_cli("current")
+        self.assertIn("wire_api: responses", result.stdout)
+        result = self.run_cli("list")
+        self.assertIn("chat", result.stdout)
+
+    def test_wire_api_inserted_when_missing(self) -> None:
+        (self.home / "config.toml").write_text(
+            CONFIG_TEMPLATE.replace('wire_api = "responses"\n', "").format(
+                base_url="https://original.example/v1"
+            ),
+            encoding="utf-8",
+        )
+        self.run_cli("save", "original")
+        self.run_cli(
+            "add",
+            "chatproxy",
+            "--base-url",
+            "https://chat.example/v1",
+            "--wire-api",
+            "chat",
+            "--api-key-stdin",
+            "--use",
+            input_text="sk-test-proxy\n",
+        )
+        config = tomllib.loads((self.home / "config.toml").read_text())
+        self.assertEqual(config["model_providers"]["OpenAI"]["wire_api"], "chat")
+
+        self.run_cli("use", "original")
+        config = tomllib.loads((self.home / "config.toml").read_text())
+        self.assertEqual(config["model_providers"]["OpenAI"]["wire_api"], "responses")
+        registry = self.load_registry()
+        self.assertEqual(registry["profiles"]["original"]["wire_api"], "responses")
+
+    def test_wire_api_inserted_at_eof_without_final_newline(self) -> None:
+        config_path = self.home / "config.toml"
+        config_path.write_text(
+            'model_provider = "OpenAI"\n'
+            '[model_providers.OpenAI]\n'
+            'base_url = "https://original.example/v1"',
+            encoding="utf-8",
+        )
+        self.run_cli("save", "original")
+        self.run_cli(
+            "add", "chatproxy",
+            "--base-url", "https://chat.example/v1",
+            "--wire-api", "chat",
+            "--api-key-stdin", "--use",
+            input_text="sk-test-proxy\n",
+        )
+        config = tomllib.loads(config_path.read_text())
+        provider = config["model_providers"]["OpenAI"]
+        self.assertEqual(provider["base_url"], "https://chat.example/v1")
+        self.assertEqual(provider["wire_api"], "chat")
+        self.run_cli("use", "original")
+        config = tomllib.loads(config_path.read_text())
+        self.assertEqual(
+            config["model_providers"]["OpenAI"]["wire_api"], "responses"
+        )
+
+    def test_registry_profiles_without_wire_api_default_to_responses(self) -> None:
+        self.run_cli("save", "original")
+        registry_path = self.home / "provider-profiles.json"
+        registry = self.load_registry()
+        for profile in registry["profiles"].values():
+            profile.pop("wire_api", None)
+        registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+        self.run_cli("list")
+        registry = self.load_registry()
+        self.assertTrue(registry["profiles"])
+        for profile in registry["profiles"].values():
+            self.assertEqual(profile["wire_api"], "responses")
+
+    def test_invalid_wire_api_is_rejected(self) -> None:
+        result = self.run_cli(
+            "add",
+            "bad",
+            "--base-url",
+            "https://bad.example/v1",
+            "--wire-api",
+            "bogus",
+            "--api-key-stdin",
+            input_text="sk-test-proxy\n",
+            expected=2,
+        )
+        self.assertIn("wire-api", result.stderr)
 
     def test_busy_lock_returns_actionable_error_without_waiting(self) -> None:
         lock_path = self.home / ".provider-profiles.json.lock"
@@ -249,7 +364,7 @@ class CodexProfileTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(version.returncode, 0, msg=version.stderr)
-        self.assertEqual(version.stdout.strip(), "codex-profile 1.1.0")
+        self.assertEqual(version.stdout.strip(), "codex-profile 1.2.0")
 
 
 if __name__ == "__main__":
