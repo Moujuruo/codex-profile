@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import os
 import fcntl
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -35,6 +41,83 @@ TEST_SECRETS = {
 
 
 class CodexProfileTest(unittest.TestCase):
+    @contextmanager
+    def fake_daemon(self, reject=False, truncate=False):
+        directory = self.home / "app-server-control"
+        directory.mkdir(exist_ok=True)
+        path = directory / "app-server-control.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.listen(1)
+        listener.settimeout(5)
+        calls, errors = [], []
+
+        def serve():
+            try:
+                with listener.accept()[0] as conn:
+                    conn.settimeout(5)
+                    with conn.makefile("rb") as stream:
+                        headers = {}
+                        stream.readline()
+                        while True:
+                            line = stream.readline()
+                            if line == b"\r\n":
+                                break
+                            key, value = line.decode().split(":", 1)
+                            headers[key.lower()] = value.strip()
+                        accept = base64.b64encode(hashlib.sha1(
+                            (headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+                        ).digest()).decode()
+                        conn.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                                      f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+                        if truncate:
+                            conn.sendall(b"\x81")
+                            return
+                        while True:
+                            first, second = stream.read(2)
+                            size = second & 127
+                            if size == 126:
+                                size = struct.unpack("!H", stream.read(2))[0]
+                            elif size == 127:
+                                size = struct.unpack("!Q", stream.read(8))[0]
+                            self.assertTrue(second & 128)
+                            mask = stream.read(4)
+                            payload = bytes(v ^ mask[i % 4] for i, v in enumerate(stream.read(size)))
+                            if first & 15 == 8:
+                                return
+                            request = json.loads(payload)
+                            calls.append(request)
+                            if "id" not in request:
+                                continue
+                            result = {"id": request["id"], "result": {}}
+                            if request["method"] == "account/login/start":
+                                if reject:
+                                    result = {"id": request["id"], "error": {
+                                        "message": request["params"]["apiKey"]}}
+                                else:
+                                    result["result"] = {"type": "apiKey"}
+                                    (self.home / "auth.json").write_text(json.dumps({
+                                        "OPENAI_API_KEY": request["params"]["apiKey"]}))
+                            response = json.dumps(result).encode()
+                            header = (bytes([129, len(response)]) if len(response) < 126 else
+                                      bytes([129, 126]) + struct.pack("!H", len(response)))
+                            conn.sendall(header + response)
+                            if reject and request["method"] == "account/login/start":
+                                return
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        try:
+            yield calls
+        finally:
+            thread.join(timeout=6)
+            listener.close()
+            path.unlink(missing_ok=True)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="codex-profile-test-")
         self.home = Path(self.temp_dir.name)
@@ -389,6 +472,44 @@ class CodexProfileTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.run_cli("edit", "original", "--provider-name", value, expected=2)
                 self.assertEqual(path.read_bytes(), before)
+
+    def test_switch_syncs_daemon_and_preserves_auth_fields(self) -> None:
+        self.run_cli("save", "original")
+        with self.fake_daemon() as calls:
+            result = self.run_cli(
+                "add", "proxy", "--base-url", "https://proxy.example/v1",
+                "--api-key-stdin", "--use", input_text="sk-test-proxy\n",
+            )
+        self.assertIn("已同步 Codex 后台服务凭据", result.stdout)
+        login = next(c for c in calls if c["method"] == "account/login/start")
+        self.assertEqual(login["params"], {"type": "apiKey", "apiKey": "sk-test-proxy"})
+        auth = json.loads((self.home / "auth.json").read_text())
+        self.assertEqual(auth, {"OPENAI_API_KEY": "sk-test-proxy", "other": "preserved"})
+
+    def test_use_active_profile_refreshes_daemon(self) -> None:
+        self.run_cli("save", "original")
+        with self.fake_daemon() as calls:
+            self.run_cli("use", "original")
+        login = next(c for c in calls if c["method"] == "account/login/start")
+        self.assertEqual(login["params"]["apiKey"], "sk-test-original")
+
+    def test_daemon_error_is_redacted_and_disk_switch_is_retained(self) -> None:
+        self.run_cli("save", "original")
+        with self.fake_daemon(reject=True):
+            result = self.run_cli(
+                "add", "proxy", "--base-url", "https://proxy.example/v1",
+                "--api-key-stdin", "--use", input_text="sk-test-proxy\n",
+            )
+        self.assertIn("codex --no-daemon", result.stderr)
+        self.assertNotIn("已同步 Codex 后台服务凭据", result.stdout)
+        self.assertEqual(self.load_registry()["active"], "proxy")
+        self.assertEqual(json.loads((self.home / "auth.json").read_text())["OPENAI_API_KEY"], "sk-test-proxy")
+
+    def test_truncated_daemon_response_returns_warning(self) -> None:
+        self.run_cli("save", "original")
+        with self.fake_daemon(truncate=True):
+            result = self.run_cli("use", "original")
+        self.assertIn("未能同步", result.stderr)
 
     def test_invalid_wire_api_is_rejected(self) -> None:
         result = self.run_cli(

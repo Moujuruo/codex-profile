@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## Unreleased
 
+- Refresh a running local Codex app-server's cached API key after switching
+  profiles or editing the active profile, using its Unix WebSocket control API.
+- Refresh credentials even when selecting the already-active profile; report
+  synchronization failures without exposing secrets or discarding saved config.
 - Save and switch the provider display name (`name`) per profile via
   `--provider-name` and interactive editing; include it in deduplication and
   external-change detection.

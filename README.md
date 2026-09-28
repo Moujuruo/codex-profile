@@ -14,6 +14,7 @@
 - 按 `provider + provider_name + base_url + wire_api + API key` 自动去重
 - 检测并自动保存外部手工修改
 - 切换前自动备份 `config.toml` 和 `auth.json`
+- 切换后同步运行中的 Codex 本地后台服务凭据，避免新端点使用缓存的旧密钥
 - 原子写入，失败时尝试回滚
 - API key 隐藏输入，列表只显示短 SHA-256 标识
 - 配置库、凭据和备份使用私有文件权限
@@ -147,7 +148,21 @@ codex-profile current
 并非官方稳定的压缩开关；本工具只保存并切换真实的显示名，不保证所有版本都按此
 选择压缩方式。设置 `OpenAI` 也不保证代理具备远程压缩能力。
 
-已有 Codex 会话可能继续使用启动时加载的配置，切换后应重新启动 Codex。
+### Codex 后台服务与配置切换
+
+Codex 0.157.1 默认可使用共享后台服务，退出终端界面后服务仍可能存活。
+仅修改 `auth.json` 时，后台服务可能继续使用旧 API key，而新会话已读取新端点，
+表现为发送第一条消息时报 `Invalid API key`。
+
+本工具在切换配置、修改活动配置后，会通过当前 `CODEX_HOME` 下的本地 Unix
+控制套接字调用 `account/login/start` 同步凭据，不重启后台服务。
+重复执行 `codex-profile use <当前配置>` 也会刷新后台凭据。密钥通过套接字发送，
+不会放入命令行参数。没有后台服务时仍按原方式切换文件。
+
+同步失败时会明确提示；磁盘配置已经保存，可以用 `codex --no-daemon` 启动独立
+会话，或在其他任务结束后运行 `codex app-server daemon restart`。
+后台凭据由会话共享，已有会话可能保留原端点，因此切换后请重新打开会话；
+需要同时使用不同配置时，请使用独立的 `CODEX_HOME`。
 
 `codex-profile` 直接修改 Codex 的 `config.toml` 和 `auth.json`。其他使用 OpenAI
 SDK 的工具通常读取环境变量；可用 `eval "$(codex-profile env)"` 将当前活动配置

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import contextlib
 import datetime as dt
@@ -15,9 +16,12 @@ import os
 import re
 import shutil
 import shlex
+import socket
 import stat
+import struct
 import sys
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -453,6 +457,134 @@ def backup_live(paths: Paths) -> Path:
     return destination
 
 
+def daemon_login(socket_path: Path, api_key: str) -> None:
+    """Refresh local app-server auth over its Unix WebSocket control socket."""
+    deadline = time.monotonic() + 5
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        def remaining() -> None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise TimeoutError("daemon auth sync timed out")
+            connection.settimeout(timeout)
+
+        remaining()
+        connection.connect(str(socket_path))
+
+        def read_exact(length: int) -> bytes:
+            chunks = bytearray()
+            while len(chunks) < length:
+                remaining()
+                chunk = connection.recv(length - len(chunks))
+                if not chunk:
+                    raise OSError("daemon connection closed")
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        nonce = base64.b64encode(os.urandom(16)).decode("ascii")
+        connection.sendall((
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n"
+            "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Key: {nonce}\r\n\r\n"
+        ).encode("ascii"))
+        headers = bytearray()
+        while not headers.endswith(b"\r\n\r\n"):
+            if len(headers) >= 16384:
+                raise OSError("invalid daemon handshake")
+            headers.extend(read_exact(1))
+        lines = headers.decode("latin1").split("\r\n")
+        fields = dict(line.lower().split(":", 1) for line in lines[1:] if ":" in line)
+        expected = base64.b64encode(hashlib.sha1(
+            (nonce + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        ).digest()).decode("ascii")
+        # Header names are case insensitive; the accept value is case sensitive.
+        accept = next((line.split(":", 1)[1].strip() for line in lines[1:]
+                       if line.lower().startswith("sec-websocket-accept:")), "")
+        if (lines[0].split()[1:2] != ["101"] or accept != expected
+                or fields.get("upgrade", "").strip() != "websocket"):
+            raise OSError("invalid daemon handshake")
+
+        def send(payload: bytes, opcode: int = 1) -> None:
+            mask = os.urandom(4)
+            size = len(payload)
+            if size < 126:
+                header = bytes([0x80 | opcode, 0x80 | size])
+            elif size <= 65535:
+                header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", size)
+            else:
+                header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", size)
+            remaining()
+            connection.sendall(header + mask + bytes(
+                value ^ mask[index % 4] for index, value in enumerate(payload)
+            ))
+
+        def receive() -> dict[str, Any]:
+            message = bytearray()
+            while True:
+                first, second = read_exact(2)
+                opcode, size = first & 15, second & 127
+                if size == 126:
+                    size = struct.unpack("!H", read_exact(2))[0]
+                elif size == 127:
+                    size = struct.unpack("!Q", read_exact(8))[0]
+                if second & 128 or size + len(message) > 1024 * 1024:
+                    raise OSError("invalid daemon frame")
+                payload = read_exact(size)
+                if opcode == 8:
+                    raise OSError("daemon connection closed")
+                if opcode == 9:
+                    send(payload, 10)
+                    continue
+                if opcode == 10:
+                    continue
+                if opcode not in (0, 1):
+                    raise OSError("unexpected daemon frame")
+                message.extend(payload)
+                if first & 128:
+                    result = json.loads(message)
+                    if not isinstance(result, dict):
+                        raise OSError("invalid daemon response")
+                    return result
+
+        def request(ident: int, method: str, params: dict[str, Any]) -> Any:
+            send(json.dumps({"id": ident, "method": method, "params": params}).encode())
+            while True:
+                response = receive()
+                if response.get("id") == ident:
+                    if "error" in response or "result" not in response:
+                        # Never propagate server text: it could echo a credential.
+                        raise OSError("daemon rejected auth sync")
+                    return response["result"]
+
+        request(1, "initialize", {"clientInfo": {"name": "codex-profile", "version": VERSION}})
+        send(json.dumps({"method": "initialized"}).encode())
+        result = request(2, "account/login/start", {"type": "apiKey", "apiKey": api_key})
+        if not isinstance(result, dict) or result.get("type") != "apiKey":
+            raise OSError("unexpected daemon login response")
+        send(b"", 8)
+
+
+def sync_daemon_auth(paths: Paths, api_key: str) -> None:
+    socket_path = paths.home / "app-server-control" / "app-server-control.sock"
+    if not socket_path.exists():
+        return
+    original_auth = read_text(paths.auth, "Codex 凭据")
+    try:
+        daemon_login(socket_path, api_key)
+    except (OSError, ValueError, IndexError):
+        print(
+            "警告: 配置文件已保存，但未能同步 Codex 后台服务的凭据。"
+            "请使用 codex --no-daemon 启动；或在其他任务结束后执行 "
+            "codex app-server daemon restart。",
+            file=sys.stderr,
+        )
+    else:
+        print("已同步 Codex 后台服务凭据；其他已打开会话仍可能保留原端点，请重新打开。")
+    finally:
+        # Login may rewrite auth.json; keep this tool's existing preservation contract.
+        if read_text(paths.auth, "Codex 凭据") != original_auth:
+            atomic_write_text(paths.auth, original_auth, 0o600)
+
+
 def apply_profile(paths: Paths, profile: dict[str, Any]) -> Path:
     warn_if_chat_wire_api(profile)
     original_config = read_text(paths.config, "Codex 配置")
@@ -491,6 +623,7 @@ def apply_profile(paths: Paths, profile: dict[str, Any]) -> Path:
             rollback_errors.append(f"auth.json: {rollback_exc}")
         detail = f"；回滚也失败: {', '.join(rollback_errors)}" if rollback_errors else "；已回滚"
         raise CliError(f"切换配置失败: {exc}{detail}") from exc
+    sync_daemon_auth(paths, profile["api_key"])
     return backup
 
 
@@ -686,6 +819,7 @@ def command_use(paths: Paths, registry: dict[str, Any], name: str) -> None:
     if name not in profiles:
         raise CliError(f"配置 {name!r} 不存在")
     if registry.get("active") == name:
+        sync_daemon_auth(paths, profiles[name]["api_key"])
         print(f"当前已经是 {name!r}")
         return
     backup = apply_profile(paths, profiles[name])
